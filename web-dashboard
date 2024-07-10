@@ -1,0 +1,108 @@
+def map = "${ServerName}".split(",")
+
+pipeline {
+    agent any
+    parameters {
+        gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'GIT_DASHBOARD_BRANCH', type: 'PT_BRANCH'
+        extendedChoice(defaultValue: '', description: 'Select servers you want to deploy', multiSelectDelimiter: ',', name: 'ServerName', quoteValue: false, saveJSONParameterToFile: false, type: 'PT_CHECKBOX', value: 'lou-dev-notify-web1.hellospoke.com,lou-dev-notify-web2.hellospoke.com', visibleItemCount: 8)
+    }
+    environment {
+        // GIT_DASHBOARD_BRANCH = "Contacts-Integration"
+        GIT_URL_FRONTEND = "https://CICDPipelineHS@bitbucket.org/notifydevteam/notify-web-code.git"
+        API_URL = "https://lou-dev-notify-lb-api.hellospoke.com/"
+        GIT_CREDENTIALS = 'GIT_CREDENTIAL_ID'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "Pipeline Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                git branch: "${params.GIT_DASHBOARD_BRANCH}", credentialsId: "${env.GIT_CREDENTIALS}", url: "${env.GIT_URL_FRONTEND}"
+            }
+        }
+        stage('Build') {
+            steps {
+                slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "Build Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                sh 'sed -i "s|api_url_frontend|"${API_URL}"|" src/store.ts'
+                sh '''
+                    export NVM_DIR="$HOME/.nvm"
+                    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+                    nvm alias default v12.18.4
+                    npm i
+                    npm run build
+                '''
+                // sh 'npm i'
+                // sh 'npm run build'
+                slackSend channel: 'jenkins-pipeline-dev', color: '#00aa00', message: "Build Successful - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+            }
+        }
+        stage('Artifact') {
+            steps {
+                sh ''' 
+                zip -r dev-${BUILD_NUMBER}.zip dist
+                '''
+                script {
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """scp dev-${BUILD_NUMBER}.zip deploy@${map[i]}:/artifact/dashboard/dev-${BUILD_TIMESTAMP}.zip"""
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+            script {
+                slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "deployment Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                for (int i = 0; i < map.size(); i++) {
+                        sh """ssh -t deploy@${map[i]} << EOF
+                        ln -sf /artifact/dashboard/dev-${BUILD_TIMESTAMP}.zip /artifact/dashboard/current_version;
+                        unzip -o /artifact/dashboard/current_version -d /var/www/html;
+                        sudo systemctl restart nginx
+                        """.stripIndent()
+                    }
+                }
+            }
+        }
+        // stage('validation') {
+        //     steps {
+        //         script {
+        //             for (int i = 0; i < map.size(); i++) {
+        //                 String code = sh(script: "curl -I -s -o /dev/null --head -w '%{http_code}' 'https://lou-dev-notify-lb-web.hellospoke.com/status' -k",returnStdout:true).trim()
+        //                 echo "HTTP response status code ===>>>: $code"
+        //                 if ("$code" == "200"){
+        //                     echo "success"
+        //                 } else {
+        //                     slackSend channel: 'jenkins-pipeline-dev', color: '#b50000', message: "Validation failed as lb endpoint gave $code status code - Job: ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+        //                     error "failed and rollback to last stable build because lb endpoint is $code" 
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
+    }
+    post {
+    always {
+        cleanWs()
+    }
+    success {
+            script {
+                    slackSend channel: 'jenkins-pipeline-dev', color: '#00aa00', message: "Pipeline executed successfully - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """ssh -t deploy@${map[i]} << EOF
+                    ln -sf /artifact/dashboard/dev-${BUILD_TIMESTAMP}.zip /artifact/dashboard/stable_version;
+                    rm -rf `ls -td /artifact/dashboard/*.zip | awk \\\'NR>5\\\'`
+                    """.stripIndent()
+                    }
+                }
+            }
+    failure {
+            script {
+                    slackSend channel: 'jenkins-pipeline-dev', color: '#b50000', message: "Pipeline failed and rollbacked - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """ssh -t deploy@${map[0]} << EOF
+                    unzip -o /artifact/dashboard/stable_version -d /var/www/html;
+                    sudo systemctl restart nginx
+                    """.stripIndent()
+                    }
+                }
+            }
+        }
+    }

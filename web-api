@@ -1,0 +1,149 @@
+def map = "${ServerName}".split(",")
+
+pipeline {
+    agent any
+    parameters {
+        gitParameter branchFilter: 'origin/(.*)', defaultValue: 'master', name: 'GIT_API_BRANCH', type: 'PT_BRANCH'
+        extendedChoice(defaultValue: '', description: 'Select servers you want to deploy', multiSelectDelimiter: ',', name: 'ServerName', quoteValue: false, saveJSONParameterToFile: false, type: 'PT_CHECKBOX', value: 'lou-dev-notify-web2.hellospoke.com,lou-dev-notify-web1.hellospoke.com', visibleItemCount: 8)
+    }
+    environment {
+        // GIT_API_BRANCH = "Contacts-Integration"
+        GIT_URL = "https://CICDPipelineHS@bitbucket.org/notifydevteam/notify-api-code.git"
+        BUILD_ENV="DEV"       // value based on SSM parameter store path and jenkins folder in bitbucket 
+        AWS_REGION="us-east-1"
+        GIT_CREDENTIALS = 'GIT_CREDENTIAL_ID'
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "Pipeline Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                git branch: "${env.GIT_API_BRANCH}", credentialsId: "${env.GIT_CREDENTIALS}", url: "${env.GIT_URL}"
+            }
+        }
+        stage('Credentials Injection'){
+            steps {
+                withAWSParameterStore(credentialsId: 'AWS_CREDENTIALS', naming: 'relative', path: "/API/${env.BUILD_ENV}/", recursive: true, regionName: "${env.AWS_REGION}") {
+                    sh 'printenv > .env'    
+                }
+            }
+        }
+        stage ('Static code Analysis') {
+            tools {
+                jdk "jdk11" // the name you have given the JDK installation in Global Tool Configuration
+            }
+            environment {
+                scannerHome = tool 'SonarQube' // the name you have given the Sonar Scanner (in Global Tool Configuration)
+            }
+            steps {       
+        // Sonarqube Analysis
+                withSonarQubeEnv ('SonarQube') {
+                    sh 'echo SonarQube Analysis'
+                    sh 'echo ${scannerHome}'
+                    sh 'export JAVA_HOME=/usr/lib/jvm/java-1.11.0-openjdk-amd64/bin/java'
+                    sh '${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=notify-api-code-qa'
+                 }
+        // Sonarqube Quality Gate
+                 sh 'echo SonarQube Quality gate'
+                 timeout(time: 1, unit: 'HOURS') {
+                  waitForQualityGate abortPipeline: false
+              }
+            }
+        }
+        stage('Build') {
+            steps {
+                slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "Build Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                sh '''
+                    export NVM_DIR="$HOME/.nvm"
+                    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+                    nvm alias default v12.18.4
+                    npm install
+                    npm run build
+                '''
+                slackSend channel: 'jenkins-pipeline-dev', color: '#00aa00', message: "Build Successful - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+            }
+        }
+        stage('Artifact') {
+            steps {
+                sh """
+                    zip -qq -r dev-${BUILD_NUMBER}.zip .
+                """
+                script {
+                    for (int i = 0; i < map.size(); i++) {
+                        sh """scp dev-${BUILD_NUMBER}.zip deploy@${map[i]}:/artifact/api/dev-${BUILD_TIMESTAMP}.zip"""
+                    }
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                script {
+                    slackSend channel: 'jenkins-pipeline-dev', color: '#439FED', message: "deployment Started - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """ssh -t deploy@${map[i]} << EOF
+                    ln -sf /artifact/api/dev-${BUILD_TIMESTAMP}.zip /artifact/api/current_version;
+                    unzip -qq -o /artifact/api/current_version -d /apps/;
+                    cd /apps/;
+                    chmod +x jenkins/dev/deploy.sh;
+                    ./jenkins/dev/deploy.sh;
+                    pm2 restart hs-notify-dev-api
+                    ls -al;
+                    sudo systemctl restart nginx;
+                    """.stripIndent()
+                    }
+                }
+            }
+        }
+        stage ('wait') {
+            steps { sleep time: 100, unit: 'SECONDS'}
+        }
+        stage('validation') {
+            steps {
+                script {
+                    for (int i = 0; i < map.size(); i++) {
+                    String code = sh(script: "ssh deploy@${map[i]} \' curl -I -s -o /dev/null --head -w '%{http_code}' 'localhost:8040/status' \' ",returnStdout:true).trim()
+                    echo "$code"
+                    if ("$code" == "200"){
+                            echo "success"
+                        } else {
+                            slackSend channel: 'jenkins-pipeline-dev', color: '#b50000', message: "Validation failed as local endpoint gave $code status code - Job: ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                            error "failed and rollback to last stable build because lb endpoint is $code" 
+                    }
+                    
+                    }
+                    
+                }
+            }
+        }
+    }
+    post {
+    always {
+        cleanWs()
+    }
+    success {
+            script {
+                    slackSend channel: 'jenkins-pipeline-dev', color: '#00aa00', message: "Pipeline executed successfully - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """ssh -t deploy@${map[i]} << EOF
+                    ln -sf /artifact/api/dev-${BUILD_TIMESTAMP}.zip /artifact/api/stable_version;
+                    cd /artifact/api;
+                    rm -rf \\`ls -td /artifact/api/*.zip | awk 'NR>7'\\`
+                    """.stripIndent()
+                    }
+                }
+            }
+    failure {
+            script {
+                    slackSend channel: 'jenkins-pipeline-dev', color: '#b50000', message: "Pipeline failed and rollbacked - ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)"
+                    for (int i = 0; i < map.size(); i++) {
+                    sh """ssh -t deploy@${map[i]} << EOF
+                    unzip -qq -o /artifact/api/stable_version -d /apps/;
+                    cd /apps/;
+                    chmod +x jenkins/dev/deploy.sh;
+                    ./jenkins/dev/deploy.sh;
+                    sudo systemctl restart nginx
+                    """.stripIndent()
+                    }
+                }
+            }
+        }
+    }
