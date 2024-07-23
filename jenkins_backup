@@ -1,0 +1,13 @@
+AWS_BUCKET_NAME="dev-backup-jenkins-devops"
+
+echo 'tar ${JENKINS_HOME} directory'
+set +e 
+tar -cvf jenkins_backup-${BUILD_NUMBER}.tar -C ${JENKINS_HOME} .
+exitcode=$?
+if [ "$exitcode" != "1" ] && [ "$exitcode" != "0" ]; then
+exit $exitcode
+fi
+set -e
+
+echo 'Upload jenkins_backup.tar to S3 bucket'
+/usr/local/bin/aws s3 mv jenkins_backup-${BUILD_NUMBER}.tar s3://${AWS_BUCKET_NAME}/
