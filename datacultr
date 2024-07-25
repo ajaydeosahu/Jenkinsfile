@@ -192,7 +192,7 @@ spec:
         script {
             sleep 5m
             // Your curl command here
-            def authHeader = 'Basic RENfREVWT1BTOkRDX0RFVk9QUw=='
+            def authHeader = 'Basic XYZ'
             def cookie = 'session=e3028044-3f5b-472c-b6a0-840b41947b4a.keGVxdOKDxQT2WO-ErP8eyZ_oFQ'
             def logicalDate = sh(script: "date -u +'%Y-%m-%dT%H:%M:%S.%3N%:z' -d '+1 min'", returnStdout: true).trim()
 
