@@ -1,0 +1,212 @@
+pipeline {
+  environment {
+    gitCredentials = 'GitHubJenkins'
+    dockerRegistryCredential = 'DockerHub'
+    DOCKER_REPO_NAME="abc/dem"
+    helm_repo_url = "https://github.com/claymcenter/K8-Helm.git"
+    helm_repo_branch = "master"
+    helm_repo_name = "K8-Helm"
+    helm_value_path = ""
+    GIT_USER_EMAIL = "dcjenkins@abc.com"
+    GIT_USER_NAME = "k8jenkins"
+    GIT_COMMIT_SHORT = sh(script: "git config --global --add safe.directory '*' && printf \$(git rev-parse --short ${GIT_COMMIT})", returnStdout: true).trim()
+    ENVIRONMENT = ""
+    branch = ""
+  }
+  options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+  agent {
+    kubernetes {
+        label 'jenkinsruner'
+        defaultContainer 'executer'
+        yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: executer
+    image: abc/jenkins-build-agent:2.0
+    securityContext:
+      privileged: true
+    volumeMounts:
+      - name: dind-storage
+        mountPath: /var/lib/docker
+  volumes:
+    - name: dind-storage
+      emptyDir: {}
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+            - key: "data-services"
+              operator: In
+              values:
+              - "true"
+"""
+        }
+      }
+  stages {
+        stage('Check Docker Daemon') {
+            steps {
+              container('executer') {
+                script {
+                    def retries = 5
+                    def dockerSocket = 'unix:///var/run/docker.sock'
+                    def dockerRunning = false
+                    
+                    // Retry connecting to Docker socket
+                    for (int i = 0; i < retries; i++) {
+                        try {
+                            sh "docker --host=${dockerSocket} info"
+                            dockerRunning = true
+                            break
+                        } catch (Exception e) {
+                            echo "Failed to connect to Docker daemon. Retrying... Attempt ${i+1} of ${retries}"
+                            sleep 15 // Wait for a while before retrying
+                        }
+                    }
+                    
+                    if (!dockerRunning) {
+                        error "Failed to connect to Docker daemon after ${retries} attempts. Aborting pipeline."
+                    }
+                }
+              }
+            }
+        }
+    stage('Build Application Docker Image') {
+      steps {
+        slackSend channel: "deploy", message: "Build Started for: ${env.JOB_NAME} ${env.GIT_BRANCH}"
+        container('executer') {
+          script {
+            echo 'Build start'
+            app = docker.build("${DOCKER_REPO_NAME}:${env.GIT_COMMIT_SHORT}")
+          }
+        }
+      }
+    }
+    stage('Scan Docker Image') {
+            options {
+                skipDefaultCheckout()
+            }
+            steps {
+                container('executer') {
+                    script {
+                        echo 'Scan with trivy'
+                        sh '''
+                        curl -o html.tpl "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl"
+	                      trivy image ${DOCKER_REPO_NAME}:${GIT_COMMIT_SHORT} --format template --template "@html.tpl" -o scan-report.html
+                        trivy image ${DOCKER_REPO_NAME}:${GIT_COMMIT_SHORT} --ignore-unfixed -f json -o scan-report.json
+                        '''
+                        echo 'Archive scan report'
+                        archiveArtifacts artifacts: 'scan-report.json'
+                        archiveArtifacts artifacts: 'scan-report.html'
+                        echo 'Docker Image Vulnerability Scanning'
+                        high = sh(script: 'cat scan-report.json | jq .Results[].Vulnerabilities[].Severity | grep HIGH | wc -l', returnStdout: true).trim()
+                        echo "High: ${high}"
+                        critical = sh(script: 'cat scan-report.json | jq .Results[].Vulnerabilities[].Severity | grep CRITICAL | wc -l', returnStdout: true).trim()
+                        echo "Critical: ${critical}"
+                        slackSend channel: "deploy", message: "Trivy scan completed for: ${env.JOB_NAME} ${env.GIT_BRANCH} Scan Result: Critical: ${critical} High: ${high}"
+                        slackSend channel:'deploy', message: "Trivy scan report URL: " + env.JENKINS_URL + "job/"+ env.JOB_NAME
+                    }
+                }
+            }
+        }
+
+    stage('Push Application Docker Image') {
+      steps {
+        container('executer') {
+          script {
+            echo 'Push start'
+            docker.withRegistry('https://registry.hub.docker.com', dockerRegistryCredential ) {
+            app.push()
+            }
+          }
+        }
+      }
+    }
+    stage('Update docker image to the environment') {
+            steps {
+                container('executer') {
+                    script {
+                        def branch = env.GIT_BRANCH ?: sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                        def BRANCH_NAME = "${branch.split("/")[1]}"
+                        echo "value ${BRANCH_NAME}" 
+                        if (BRANCH_NAME == 'master_k8' || BRANCH_NAME == 'main_devops' || BRANCH_NAME == 'k8_main' || BRANCH_NAME == 'test') {
+                            ENVIRONMENT = "test"
+                            echo "${ENVIRONMENT}"
+                        } else if (BRANCH_NAME == 'stage') {
+                            ENVIRONMENT = "stage"
+                            echo "${ENVIRONMENT}"
+                        } else if (BRANCH_NAME == 'uat') {
+                            ENVIRONMENT = "uat"
+                            echo "${ENVIRONMENT}"
+                        } else if (BRANCH_NAME == 'prod') {
+                            ENVIRONMENT = "prod"
+                            echo "${ENVIRONMENT}"
+                        } else {
+                            echo "Exiting Job"
+                        }
+                        // Set helm_value_path based on environmentName
+                        helm_value_path = "dem-server/dem/${ENVIRONMENT}-values.yaml"
+                        echo "Helm value path: ${helm_value_path}"
+
+                        withCredentials([gitUsernamePassword(credentialsId: 'GitHubJenkins', gitToolName: 'Default')]) {
+                            withEnv(["helm_value_path=${helm_value_path}"]) {
+                            sh '''
+                            cd ..
+                            git clone -b $helm_repo_branch $helm_repo_url
+                            git config --global user.email $GIT_USER_EMAIL
+                            git config --global user.name $GIT_USER_NAME
+                            ls -al
+                            cd ${helm_repo_name}/charts
+                            yq e -i '(.image.tag = "'${GIT_COMMIT_SHORT}'")' ${helm_value_path}
+                            yq e -i '(.cron.image.tag = "'${GIT_COMMIT_SHORT}'")' ${helm_value_path}
+                            yq e -i '(.migration.image.tag = "'${GIT_COMMIT_SHORT}'")' ${helm_value_path}
+                            git add .
+                            git commit -m "Docker Image version Updated by Jenkins"
+                            git push origin $HELM_CHART_GIT_BRANCH
+                            '''
+                      }
+                  }
+              }
+            }
+        }
+    }
+  }
+   post {
+       failure {
+           slackSend message: 'Pipeline for ' + env.JOB_NAME + ' with Build Id - ' +  env.BUILD_ID + ' Failed'
+       }
+
+       success {
+           slackSend message: 'Pipeline for ' + env.JOB_NAME + ' with Build Id - ' +  env.BUILD_ID + ' SUCCESSFUL'
+       }
+   }
+   stage('test workflow curl') {
+    when {
+        environment name: 'ENVIRONMENT', value: 'test'
+    }
+    steps {
+        script {
+            sleep 5m
+            // Your curl command here
+            def authHeader = 'Basic RENfREVWT1BTOkRDX0RFVk9QUw=='
+            def cookie = 'session=e3028044-3f5b-472c-b6a0-840b41947b4a.keGVxdOKDxQT2WO-ErP8eyZ_oFQ'
+            def logicalDate = sh(script: "date -u +'%Y-%m-%dT%H:%M:%S.%3N%:z' -d '+1 min'", returnStdout: true).trim()
+
+            def curlCommand = """
+            curl --location 'https://af2.wrtual.in/api/v1/dags/CV2_workflow/dagRuns' \\
+            --header 'Content-Type: application/json' \\
+            --header 'Authorization: ${authHeader}' \\
+            --header 'Cookie: ${cookie}' \\
+            --data '{
+              \"logical_date\": \"${logicalDate}\"
+            }'
+            """
+
+            sh curlCommand
+        }
+    }
+}
